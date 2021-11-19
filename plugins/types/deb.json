@@ -1,9 +1,0 @@
-{"types": [
-    {
-        "id": "deb",
-        "display_name": "DEB",
-        "description": "DEB",
-        "unit_key": ["name", "version", "architecture"],
-        "search_indexes": []
-    }
-]}

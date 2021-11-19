@@ -1,25 +1,57 @@
-from gettext import gettext as _
-import hashlib
 import logging
 import os
-import shutil
 import urlparse
+import hashlib
+import gnupg
+from collections import defaultdict
+from gettext import gettext as _
+from distutils.version import LooseVersion
 
-from debian import debian_support
+from debpkgr import aptrepo
 from nectar.request import DownloadRequest
-from pulp.plugins.util import misc
-from pulp.plugins.util.publish_step import PluginStep, GetLocalUnitsStep, DownloadStep
-from pulp.server.exceptions import PulpCodedValidationException
+from pulp.plugins.util import misc, publish_step
+from pulp.common.error_codes import Error
+from pulp.server.exceptions import PulpCodedTaskFailedException
 
-from pulp_deb.common import constants
-from pulp_deb.plugins import error_codes
-
+from pulp_deb.common import constants, ids
+from pulp_deb.plugins.db import models
 
 _logger = logging.getLogger(__name__)
 
 
-class SyncStep(PluginStep):
-    def __init__(self, **kwargs):
+DEBSYNC001 = Error(
+    "DEBSYNC001",
+    "Unable to sync %(repo_id)s from %(feed_url)s:"
+    " expected one comp, got %(comp_count)s",
+    ["repo_id", "feed_url", "comp_count"])
+
+DEBSYNC002 = Error(
+    "DEBSYNC002",
+    "Unable to sync %(repo_id)s from %(feed_url)s: mismatching checksums"
+    " for %(filename)s: expected %(checksum_expected)s,"
+    " actual %(checksum_actual)s",
+    ["repo_id", "feed_url", "filename", "checksum_expected", "checksum_actual"])
+
+
+def verify_unit_callback(unit):
+    if not os.path.isfile(unit.storage_path):
+        return False
+    checksums = unit.calculate_deb_checksums(unit.storage_path)
+    if unit.sha1 and unit.sha1 != checksums['sha1']:
+        return False
+    if unit.md5sum and unit.md5sum != checksums['md5sum']:
+        return False
+    if unit.sha256 and unit.sha256 != checksums['sha256']:
+        return False
+    return True
+
+
+class RepoSync(publish_step.PluginStep):
+    Type_Class_Map = {
+        models.DebPackage.TYPE_ID: models.DebPackage,
+    }
+
+    def __init__(self, repo, conduit, config):
         """
         :param repo:        repository to sync
         :type  repo:        pulp.plugins.model.Repository
@@ -27,183 +59,383 @@ class SyncStep(PluginStep):
         :type  conduit:     pulp.plugins.conduits.repo_sync.RepoSyncConduit
         :param config:      config object for the sync
         :type  config:      pulp.plugins.config.PluginCallConfiguration
-        :param working_dir: full path to the directory in which transient files
-                            should be stored before being moved into long-term
-                            storage. This should be deleted by the caller after
-                            step processing is complete.
-        :type  working_dir: basestring
         """
-        super(SyncStep, self).__init__(constants.IMPORT_STEP_MAIN,
-                                       plugin_type=constants.WEB_IMPORTER_TYPE_ID, **kwargs)
+        super(RepoSync, self).__init__(step_type=constants.SYNC_STEP,
+                                       repo=repo,
+                                       conduit=conduit,
+                                       config=config)
         self.description = _('Syncing Repository')
 
-        # Unit keys, populated by GetMetadataStep
-        self.available_units = []
+        self.feed_url = self.get_config().get('feed').strip('/')
+        self.distributions = self.get_config().get('releases', 'stable').split(',')
+        self.architectures = split_or_none(self.get_config().get('architectures'))
+        self.components = split_or_none(self.get_config().get('components'))
+        self.remove_missing = self.get_config().get_boolean(
+            constants.CONFIG_REMOVE_MISSING_UNITS, constants.CONFIG_REMOVE_MISSING_UNITS_DEFAULT)
+        self.repair_sync = self.get_config().get_boolean(constants.CONFIG_REPAIR_SYNC, False)
 
-        # config = self.get_config()
-        working_dir = self.get_working_dir()
-        self.deb_data = {}
-        # repo = self.get_repo()
+        self.unit_relative_urls = {}
+        self.available_units = None
+        # dicts with the distribution as keys to multiplex variables
+        self.apt_repo_meta = {}
+        self.release_units = {}
+        self.release_files = {
+            distribution: os.path.join(self.get_working_dir(), distribution, 'Release')
+            for distribution in self.distributions
+        }
+        self.feed_urls = {
+            distribution: urlparse.urljoin(self.feed_url + '/', '/'.join(['dists', distribution]))
+            for distribution in self.distributions
+        }
+        self.release_urls = {
+            distribution: urlparse.urljoin(self.feed_urls[distribution] + '/', 'Release')
+            for distribution in self.distributions
+        }
+        self.packages_urls = {}
+        # double dicts with distribution/component as keys
+        self.component_units = defaultdict(dict)
+        self.component_packages = defaultdict(dict)
 
-        # create a Repository object to interact with
-        self.add_child(GetMetadataStep())
-        self.step_get_local_units = GetLocalUnitsStepDeb()
-        self.add_child(self.step_get_local_units)
-        self.add_child(
-            DownloadStep(constants.SYNC_STEP_DOWNLOAD, downloads=self.generate_download_requests(),
-                         repo=kwargs["repo"], config=kwargs["config"],
-                         working_dir=kwargs["working_dir"],
-                         description=_('Downloading remote files')))
-        self.add_child(SaveUnits(working_dir))
+        for distribution in self.distributions:
+            misc.mkdir(os.path.dirname(self.release_files[distribution]))
+            _logger.info("Downloading %s", self.release_urls[distribution])
 
-    def generate_download_requests(self):
-        """
-        generator that yields DownloadRequests for needed units.
+        # defining lifecycle
+        #  metadata
+        self.add_child(publish_step.DownloadStep(
+            constants.SYNC_STEP_RELEASE_DOWNLOAD,
+            plugin_type=ids.TYPE_ID_IMPORTER,
+            description=_('Retrieving metadata: Release file(s)'),
+            downloads=[
+                DownloadRequest(self.release_urls[distribution], self.release_files[distribution])
+                for distribution in self.distributions] + [
+                DownloadRequest(self.release_urls[distribution] + '.gpg',
+                                self.release_files[distribution] + '.gpg')
+                for distribution in self.distributions]
+        ))
 
-        :return:    generator of DownloadRequest instances
-        :rtype:     collections.Iterable[DownloadRequest]
-        """
-        feed_url = self.get_config().get('feed')
-        for unit_key in self.step_get_local_units.units_to_download:
-            key_hash = get_key_hash(unit_key)
-            # Don't save all the units in one directory as there could be 50k + units
-            hash_dir = generate_internal_storage_path(self.deb_data[key_hash]['file_name'])
-            # make sure the download directory exists
-            dest_dir = os.path.join(self.working_dir, hash_dir)
-            download_dir = os.path.dirname(dest_dir)
-            misc.mkdir(download_dir)
-            file_path = self.deb_data[key_hash]['file_path']
-            packages_url = urlparse.urljoin(feed_url, file_path)
-            yield DownloadRequest(packages_url, dest_dir)
+        self.add_child(ParseReleaseStep(constants.SYNC_STEP_RELEASE_PARSE))
 
+        self.step_download_Packages = publish_step.DownloadStep(
+            constants.SYNC_STEP_PACKAGES_DOWNLOAD,
+            plugin_type=ids.TYPE_ID_IMPORTER,
+            description=_('Retrieving metadata: Packages files'))
+        self.add_child(self.step_download_Packages)
 
-class GetMetadataStep(PluginStep):
-    def __init__(self, **kwargs):
-        """
-        :param repo:        repository to sync
-        :type  repo:        pulp.plugins.model.Repository
-        :param conduit:     sync conduit to use
-        :type  conduit:     pulp.plugins.conduits.repo_sync.RepoSyncConduit
-        :param config:      config object for the sync
-        :type  config:      pulp.plugins.config.PluginCallConfiguration
-        :param working_dir: full path to the directory in which transient files
-                            should be stored before being moved into long-term
-                            storage. This should be deleted by the caller after
-                            step processing is complete.
-        :type  working_dir: basestring
-        """
-        super(GetMetadataStep, self).__init__(constants.IMPORT_STEP_METADATA,
-                                              plugin_type=constants.WEB_IMPORTER_TYPE_ID,
-                                              **kwargs)
-        self.description = _('Retrieving metadata')
+        self.add_child(ParsePackagesStep(constants.SYNC_STEP_PACKAGES_PARSE))
 
-    def process_main(self):
-        """
-        determine what images are available upstream, get the upstream tags, and
-        save a list of available unit keys on the parent step
-        """
-        super(GetMetadataStep, self).process_main()
-        _logger.debug(self.description)
-        packages_url = self.get_config().get('feed')
-        packages_path = self.get_config().get('package-file-path')
-        if not packages_url.endswith('/'):
-            packages_url += '/'
-        if packages_path:
-            if packages_path.startswith('/'):
-                packages_path = packages_path[1:]
-            packages_url = urlparse.urljoin(packages_url, packages_path)
-        packpath = os.path.join(self.get_working_dir(), "Packages")
-        debian_support.download_file(packages_url + "Packages", packpath)
-        for package in debian_support.PackageFile(packpath):
-            package_data = dict(package)
-            metadata = get_metadata(package_data)
-            unit_key_hash = get_key_hash(metadata)
-            self.parent.deb_data[unit_key_hash] = {
-                'file_name': os.path.basename(package_data['Filename']),
-                'file_path': package_data['Filename'],
-                'file_size': package_data['Size']
-            }
-            self.parent.available_units.append(metadata)
+        #  packages
+        if self.repair_sync:
+            verify_unit = verify_unit_callback
+        else:
+            verify_unit = None
+        self.step_local_units = publish_step.GetLocalUnitsStep(
+            importer_type=ids.TYPE_ID_IMPORTER, verify_unit=verify_unit)
+        self.add_child(self.step_local_units)
 
+        self.add_child(CreateRequestsUnitsToDownload(
+            constants.SYNC_STEP_UNITS_DOWNLOAD_REQUESTS))
 
-class GetLocalUnitsStepDeb(GetLocalUnitsStep):
+        self.step_download_units = publish_step.DownloadStep(
+            constants.SYNC_STEP_UNITS_DOWNLOAD,
+            plugin_type=ids.TYPE_ID_IMPORTER,
+            description=_('Retrieving units'))
+        self.add_child(self.step_download_units)
 
-    def __init__(self):
-        super(GetLocalUnitsStepDeb, self).__init__(constants.WEB_IMPORTER_TYPE_ID)
+        self.add_child(SaveDownloadedUnits(constants.SYNC_STEP_SAVE))
 
-    def _dict_to_unit(self, unit_dict):
-        unit_key_hash = get_key_hash(unit_dict)
-        file_name = self.parent.deb_data[unit_key_hash]['file_name']
-        storage_path = generate_internal_storage_path(file_name)
-        unit_dict.pop('_id')
-        return_unit = self.get_conduit().init_unit(
-            constants.DEB_TYPE_ID, unit_dict,
-            {'file_name': file_name},
-            storage_path)
-        return return_unit
+        #  metadata
+        self.add_child(SaveMetadataStep(constants.SYNC_STEP_SAVE_META))
+
+        self.debs_to_check = {}
+        self.deb_comps_to_check = {}
+        self.deb_releases_to_check = {}
+        # cleanup
+        if self.remove_missing:
+            units_to_check = self.conduit.get_units()
+            self.debs_to_check = {unit.id: unit for unit in units_to_check
+                                  if unit.type_id == ids.TYPE_ID_DEB}
+            self.deb_comps_to_check = {unit.id: unit for unit in units_to_check
+                                       if unit.type_id == ids.TYPE_ID_DEB_COMP}
+            self.deb_releases_to_check = {unit.id: unit for unit in units_to_check
+                                          if unit.type_id == ids.TYPE_ID_DEB_RELEASE}
+            del units_to_check
+            self.add_child(OrphanRemovedUnits(constants.SYNC_STEP_ORPHAN_REMOVED_UNITS))
 
 
-class SaveUnits(PluginStep):
-    def __init__(self, working_dir):
-        super(SaveUnits, self).__init__(step_type=constants.SYNC_STEP_SAVE,
-                                        plugin_type=constants.WEB_IMPORTER_TYPE_ID,
-                                        working_dir=working_dir)
-        self.description = _('Saving packages')
+class ParseReleaseStep(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(ParseReleaseStep, self).__init__(*args, **kwargs)
+        self.description = _('Parse Release Files')
 
-    def process_main(self):
-        _logger.debug(self.description)
-        for unit_key in self.parent.step_get_local_units.units_to_download:
-            hash_key = get_key_hash(unit_key)
-            file_name = self.parent.deb_data[hash_key]['file_name']
-            storage_path = generate_internal_storage_path(file_name)
-            dest_dir = os.path.join(self.working_dir, storage_path)
-            # validate the size of the file downloaded
-            file_size = int(self.parent.deb_data[hash_key]['file_size'])
-            if file_size != os.stat(dest_dir).st_size:
-                raise PulpCodedValidationException(error_code=error_codes.DEB1001,
-                                                   file_name=file_name)
+    def gnupg_factory(self, *args, **kwargs):
+        if 'homedir' in kwargs.keys():
+            module_version_gnupg = LooseVersion(gnupg.__version__)
+            if module_version_gnupg < LooseVersion('1.0.0'):
+                kwargs['gnupghome'] = kwargs['homedir']
+                del(kwargs['homedir'])
+        return gnupg.GPG(*args, **kwargs)
 
-            unit = self.get_conduit().init_unit(constants.DEB_TYPE_ID, unit_key,
-                                                {'file_name': file_name},
-                                                storage_path)
-            shutil.move(dest_dir, unit.storage_path)
-            self.get_conduit().save_unit(unit)
+    def verify_release_file(self, distribution):
+        rel_file = self.parent.release_files[distribution]
+        # check if Release file exists
+        if not os.path.isfile(rel_file):
+            raise Exception("Release file not found. Check the feed option.")
+        # check signature
+        if not self.get_config().get_boolean(constants.CONFIG_REQUIRE_SIGNATURE, False):
+            return
+        worker_gpg_homedir = os.path.join(self.get_working_dir(), 'gpg-home')
+        if not os.path.exists(worker_gpg_homedir):
+            os.mkdir(worker_gpg_homedir, 0o700)
+        gpg = self.gnupg_factory(homedir=worker_gpg_homedir)
+        shared_gpg = self.gnupg_factory(homedir=os.path.join('/', 'var', 'lib', 'pulp', 'gpg-home'))
+
+        if self.get_config().get(constants.CONFIG_GPG_KEYS):
+            import_res = gpg.import_keys(self.get_config().get(constants.CONFIG_GPG_KEYS))
+            _logger.info("Importing GPG-Key: %r", import_res.results)
+            if import_res.count == 0:
+                raise Exception("GPG-Key not imported: %r" % import_res.results)
+
+        if self.get_config().get(constants.CONFIG_ALLOWED_KEYS):
+            keyserver = self.get_config().get(constants.CONFIG_KEYSERVER,
+                                              constants.CONFIG_KEYSERVER_DEFAULT)
+
+            fingerprints = split_or_none(self.get_config().get(constants.CONFIG_ALLOWED_KEYS)) or []
+            # TODO check if full fingerprints are provided
+            for fingerprint in fingerprints:
+                # remove spaces from fingerprint (space would mark the next key)
+                fingerprint = fingerprint.replace(' ', '')
+                if fingerprint not in [
+                        key['fingerprint'] for key in shared_gpg.list_keys()]:
+                    shared_gpg.recv_keys(keyserver, fingerprint)
+            gpg.import_keys(shared_gpg.export_keys(fingerprints))
+
+        if len(gpg.list_keys()) == 0:
+            raise Exception("No GPG-keys in keyring, did the import fail?")
+
+        if not os.path.isfile(rel_file + '.gpg'):
+            raise Exception("Release.gpg not found. Could not verify Release file integrity.")
+
+        if LooseVersion(gnupg.__version__) < LooseVersion('1.0.0'):
+            with open(rel_file + '.gpg') as f:
+                verified = gpg.verify_file(f, rel_file)
+                if not verified.valid:
+                    raise Exception("Release file verification failed! {}".format(verified.stderr))
+        else:
+            with open(rel_file) as f:
+                verified = gpg.verify_file(f, rel_file + '.gpg')
+                if not verified.valid:
+                    raise Exception("Release file verification failed! {}".format(verified.stderr))
+
+    def process_main(self, item=None):
+        distributions = self.parent.distributions
+        components = self.parent.components
+        architectures = self.parent.architectures
+        dl_reqs = []
+        for distribution in distributions:
+            self.verify_release_file(distribution)
+            # generate repo_metas for each distribution
+            self.parent.apt_repo_meta[distribution] = repometa = aptrepo.AptRepoMeta(
+                release=open(self.parent.release_files[distribution], "rb"),
+                upstream_url=self.parent.feed_urls[distribution])
+            # get release unit
+            codename = repometa.codename
+            suite = repometa.release.get('suite')
+            release_unit = models.DebRelease.get_or_create_and_associate(
+                repo=self.parent.repo,
+                distribution=distribution,
+                codename=codename,
+                suite=suite,
+            )
+            self.parent.release_units[distribution] = release_unit
+
+            # Prevent this unit from being cleaned up
+            self.parent.deb_releases_to_check.pop(release_unit.id, None)
+            # get release component units
+            for release_file_component in repometa.components:
+                component = release_file_component.split('/')[-1]
+                if components is None or component in components:
+                    comp_unit = self.parent.component_units[distribution][component] = \
+                        models.DebComponent.get_or_create_and_associate(self.parent.repo,
+                                                                        release_unit,
+                                                                        component)
+                    self.parent.component_packages[distribution][component] = []
+                    # Prevent this unit from being cleaned up
+                    self.parent.deb_comps_to_check.pop(comp_unit.id, None)
+            # generate download requests for all relevant packages files
+            rel_dl_reqs = repometa.create_Packages_download_requests(
+                self.get_working_dir())
+            # Filter the rel_dl_reqs by selected components and architectures
+            if components:
+                rel_dl_reqs = [
+                    dlr for dlr in rel_dl_reqs
+                    if dlr.data['component'].split('/')[-1] in components]
+            if architectures:
+                rel_dl_reqs = [
+                    dlr for dlr in rel_dl_reqs
+                    if dlr.data['architecture'] in architectures]
+            self.parent.packages_urls[distribution] = set([dlr.url for dlr in rel_dl_reqs])
+            dl_reqs.extend(rel_dl_reqs)
+        self.parent.step_download_Packages._downloads = [
+            DownloadRequest(dlr.url, dlr.destination, data=dlr.data)
+            for dlr in dl_reqs]
 
 
-def get_key_hash(metadata):
-    unit_key_hash = '::'.join([metadata['name'],
-                               metadata['version'],
-                               metadata['architecture']])
-    return unit_key_hash
+class ParsePackagesStep(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(ParsePackagesStep, self).__init__(*args, **kwargs)
+        self.description = _('Parse Packages Files')
+
+    def process_main(self, item=None):
+        distributions = self.parent.distributions
+        dl_reqs = self.parent.step_download_Packages.downloads
+        units = {}
+        for distribution in distributions:
+            repometa = self.parent.apt_repo_meta[distribution]
+            repometa.validate_component_arch_packages_downloads(
+                [dlr for dlr in dl_reqs
+                    if dlr.url in self.parent.packages_urls[distribution]])
+            for ca in repometa.iter_component_arch_binaries():
+                for pkg in ca.iter_packages():
+                    try:
+                        checksum = pkg['SHA256']
+                        self.parent.unit_relative_urls[checksum] = pkg['Filename']
+                        if checksum in units:
+                            unit = units[checksum]
+                        else:
+                            unit = models.DebPackage.from_packages_paragraph(pkg)
+                            units[checksum] = unit
+                    except (KeyError, ValueError):
+                        _logger.warning(_("Invalid package record found. {}").format(pkg))
+                        continue
+                    component = ca.component.split('/')[-1]
+                    self.parent.component_packages[distribution][component].append(unit.unit_key)
+        self.parent.available_units = units.values()
 
 
-def generate_internal_storage_path(file_name):
+class CreateRequestsUnitsToDownload(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(CreateRequestsUnitsToDownload, self).__init__(*args, **kwargs)
+        self.description = _('Prepare Package Download')
+
+    def process_main(self, item=None):
+        wdir = os.path.join(self.get_working_dir())
+        reqs = []
+
+        feed_url = self.parent.feed_url
+
+        step_download_units = self.parent.step_download_units
+        step_download_units.path_to_unit = dict()
+        dirs_to_create = set()
+
+        for unit in self.parent.step_local_units.units_to_download:
+            url = os.path.join(feed_url, self.parent.unit_relative_urls[unit.checksum])
+            filename = os.path.basename(url)
+            dest_dir = os.path.join(wdir, "packages", generate_internal_storage_path(filename))
+            dirs_to_create.add(dest_dir)
+            dest = os.path.join(dest_dir, filename)
+            reqs.append(DownloadRequest(url, dest))
+            step_download_units.path_to_unit[dest] = unit
+
+        for dest_dir in dirs_to_create:
+            misc.mkdir(dest_dir)
+        step_download_units._downloads = reqs
+
+
+class SaveDownloadedUnits(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(SaveDownloadedUnits, self).__init__(*args, **kwargs)
+        self.description = _('Save and associate downloaded units')
+
+    def verify_checksum(self, calculated, from_metadata, path):
+        if calculated != from_metadata:
+            raise PulpCodedTaskFailedException(
+                DEBSYNC002, repo_id=self.get_repo().repo_obj.repo_id,
+                feed_url=self.parent.feed_url,
+                filename=os.path.basename(path),
+                checksum_expected=from_metadata,
+                checksum_actual=calculated)
+
+    def process_main(self, item=None):
+        path_to_unit = self.parent.step_download_units.path_to_unit
+        repo = self.get_repo().repo_obj
+        for path, unit in path_to_unit.items():
+            checksums = unit.calculate_deb_checksums(path)
+            if unit.sha1:
+                self.verify_checksum(checksums['sha1'], unit.sha1, path)
+            else:
+                unit.sha1 = checksums['sha1']
+            if unit.md5sum:
+                self.verify_checksum(checksums['md5sum'], unit.md5sum, path)
+            else:
+                unit.md5sum = checksums['md5sum']
+            if unit.sha256:
+                self.verify_checksum(checksums['sha256'], unit.sha256, path)
+            else:
+                unit.sha256 = checksums['sha256']
+            self.verify_checksum(unit.checksum, unit.sha256, path)
+            unit.save_and_associate(path, repo, force=self.parent.repair_sync)
+
+
+class SaveMetadataStep(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(SaveMetadataStep, self).__init__(*args, **kwargs)
+        self.description = _('Save metadata')
+
+    def process_main(self, item=None):
+        for distribution in self.parent.distributions:
+            for comp, comp_unit in self.parent.component_units[distribution].iteritems():
+                # Start with an empty set if we want to delete old entries
+                if self.parent.remove_missing:
+                    comp_unit_packages_set = set()
+                else:
+                    comp_unit_packages_set = set(comp_unit.packages)
+                for unit in [unit_key_to_unit(unit_key)
+                             for unit_key in self.parent.component_packages[distribution][comp]]:
+                    comp_unit_packages_set.add(unit.id)
+                    # Prevent this unit from being cleaned up
+                    self.parent.debs_to_check.pop(unit.id, None)
+                comp_unit.packages = list(comp_unit_packages_set)
+                comp_unit.save()
+
+
+class OrphanRemovedUnits(publish_step.PluginStep):
+    def __init__(self, *args, **kwargs):
+        super(OrphanRemovedUnits, self).__init__(*args, **kwargs)
+        self.description = _('Orphan removed units')
+
+    def process_main(self, item=None):
+        for unit in self.parent.deb_releases_to_check.values():
+            self.parent.conduit.remove_unit(unit)
+        for unit in self.parent.deb_comps_to_check.values():
+            self.parent.conduit.remove_unit(unit)
+        for unit in self.parent.debs_to_check.values():
+            self.parent.conduit.remove_unit(unit)
+
+
+def unit_key_to_unit(unit_key):
+    return models.DebPackage.objects.filter(**unit_key).first()
+
+
+def generate_internal_storage_path(filename):
     """
     Generate the internal storage directory for a given deb filename
 
-    :param file_name: base filename of the unit
-    :type file_name: str
+    :param filename: base filename of the unit
+    :type filename: str
 
-    :returns str: The relative path for storing the unit
+    :returns str: The relative directory path for storing the unit
     """
     hasher = hashlib.md5()
-    hasher.update(file_name)
+    hasher.update(filename)
     hash_digest = hasher.hexdigest()
-    part1 = hash_digest[0:1]
+    part1 = hash_digest[0:2]
     part2 = hash_digest[2:4]
-    part3 = hash_digest[5:]
-    storage_path = os.path.join(part1, part2, part3, file_name)
+    storage_path = os.path.join(part1, part2)
     return storage_path
 
 
-def get_metadata(package):
-    """
-    converts an dictionary representing a package to a unit key dictionary
-    :param package: dictionary parsed by debian_support
-    :type  package: dict
-    :return:        unit key
-    :rtype          dict
-    """
-    unit_key = {"name": package["Package"], "version": package["Version"],
-                "architecture": package["Architecture"]}
-    return unit_key
+def split_or_none(data):
+    if data:
+        return [x.strip() for x in data.split(',')]
+    return None
